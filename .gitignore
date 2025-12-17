@@ -1,6 +1,5 @@
 build/
 cmake-build-*/
-data/raw/
 results/
 .vscode/
 .idea/
