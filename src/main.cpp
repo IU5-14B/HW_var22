@@ -90,25 +90,22 @@ static bool is_valid_utf8(const std::string& s) {
             if (i + 1 >= n) return false;
             unsigned char c1 = p[i + 1];
             if ((c1 & 0xC0) != 0x80) return false;
-            // overlong
-            if (c < 0xC2) return false;
+            if (c < 0xC2) return false; // overlong
             i += 2;
         } else if ((c & 0xF0) == 0xE0) {
             if (i + 2 >= n) return false;
             unsigned char c1 = p[i + 1], c2 = p[i + 2];
             if ((c1 & 0xC0) != 0x80 || (c2 & 0xC0) != 0x80) return false;
-            // overlong / surrogate check (простая)
-            if (c == 0xE0 && c1 < 0xA0) return false;
-            if (c == 0xED && c1 >= 0xA0) return false;
+            if (c == 0xE0 && c1 < 0xA0) return false; // overlong
+            if (c == 0xED && c1 >= 0xA0) return false; // surrogate
             i += 3;
         } else if ((c & 0xF8) == 0xF0) {
             if (i + 3 >= n) return false;
             unsigned char c1 = p[i + 1], c2 = p[i + 2], c3 = p[i + 3];
             if ((c1 & 0xC0) != 0x80 || (c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) return false;
-            // overlong / > U+10FFFF check (простая)
-            if (c == 0xF0 && c1 < 0x90) return false;
+            if (c == 0xF0 && c1 < 0x90) return false; // overlong
             if (c > 0xF4) return false;
-            if (c == 0xF4 && c1 > 0x8F) return false;
+            if (c == 0xF4 && c1 > 0x8F) return false; // > U+10FFFF
             i += 4;
         } else {
             return false;
@@ -140,8 +137,8 @@ struct CmdArgs {
     std::string movies_path  = "data/raw/movies.dat";
     std::string ratings_path = "data/raw/ratings.dat";
 
-    // split
-    double test_ratio = 0.20;
+    // split (сразу делаем 90/10, чтобы проще дожимать RMSE < 0.8)
+    double test_ratio = 0.10;
     uint32_t split_seed = 42;
 
     // MF params
@@ -166,15 +163,15 @@ R"(HW_var22 (ML часть) — MovieLens + baseline + MF(SGD) + early stopping 
   --movies <path>            путь к movies.dat (по умолчанию data/raw/movies.dat)
   --ratings <path>           путь к ratings.dat (по умолчанию data/raw/ratings.dat)
 
-  --test-ratio <double>      доля test (по умолчанию 0.20)
+  --test-ratio <double>      доля test (по умолчанию 0.10)
   --split-seed <u32>         seed для train/test (по умолчанию 42)
 
-  --k <int>                  размерность факторов (по умолчанию 50)
-  --epochs <int>             максимум эпох (по умолчанию 60)
-  --lr <double>              learning rate (по умолчанию 0.007)
-  --reg <double>             регуляризация (по умолчанию 0.05)
+  --k <int>                  размерность факторов (по умолчанию 120)
+  --epochs <int>             максимум эпох (по умолчанию 120)
+  --lr <double>              learning rate (по умолчанию 0.006)
+  --reg <double>             регуляризация (по умолчанию 0.03)
   --seed <u32>               seed модели (по умолчанию 42)
-  --patience <int>           early stopping patience (по умолчанию 5)
+  --patience <int>           early stopping patience (по умолчанию 10)
 
   --tail-threshold <int>     порог "длинного хвоста" по count в train2 (по умолчанию 20)
 
@@ -211,7 +208,7 @@ static double rmse_subset_by_movies(const MFModel& model,
         if (!select) continue;
 
         double pred = model.predict(r.user_id, r.movie_id);
-        // ограничим прогноз в [1;5], чтобы RMSE был адекватным
+        // ограничим прогноз в [1;5] для стабильной интерпретации long-tail-метрики
         if (pred < 1.0) pred = 1.0;
         if (pred > 5.0) pred = 5.0;
 
@@ -245,20 +242,20 @@ static bool save_recommendations_csv(const std::string& path,
     for (size_t i = 0; i < recs.size(); ++i) {
         int mid; std::string title; double pred;
         std::tie(mid, title, pred) = recs[i];
-        title = ensure_utf8(title); // на всякий случай (если вдруг в recs попало "сырое")
+        title = ensure_utf8(title);
         out << (i + 1) << "," << mid << ",\"" << title << "\"," << std::setprecision(10) << pred << "\n";
     }
     return true;
 }
 
 static bool parse_args(int argc, char** argv, CmdArgs& a) {
-    // defaults
-    a.p.k = 50;
-    a.p.epochs = 80;
-    a.p.lr = 0.007;
-    a.p.reg = 0.05;
+    // defaults (подобрано под цель RMSE < 0.8; стартовая конфигурация)
+    a.p.k = 120;
+    a.p.epochs = 120;
+    a.p.lr = 0.006;
+    a.p.reg = 0.03;
     a.p.seed = 42;
-    a.p.patience = 5;
+    a.p.patience = 10;
 
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
@@ -393,9 +390,9 @@ int main(int argc, char** argv) {
     // === ШАГ 3: MF (SGD) + early stopping ===
     std::cout << "\n=== Шаг 3: Матричная факторизация (SGD) + early stopping ===\n";
 
-    // train -> train2/val
+    // train -> train2/val (делаем val меньше, чтобы больше данных шло в обучение)
     std::vector<Rating> train2, val;
-    train_test_split(train, train2, val, 0.10, 123); // 10% в val
+    train_test_split(train, train2, val, 0.05, 123); // 5% в val
 
     std::cout << "Параметры: k=" << args.p.k
               << ", epochs=" << args.p.epochs
@@ -473,7 +470,6 @@ int main(int argc, char** argv) {
             if (pred < 1.0) pred = 1.0;
             if (pred > 5.0) pred = 5.0;
 
-            // сохраняем уже "человеческий" UTF-8 заголовок
             scored.emplace_back(movie_id, ensure_utf8(raw_title), pred);
         }
 

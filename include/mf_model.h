@@ -49,6 +49,15 @@ private:
     std::vector<double> P_;
     std::vector<double> Q_;
 
+    // --- SVD++ fields ---
+    // Implicit feedback latent vectors per item. Same layout as Q_: size = num_items * k.
+    std::vector<double> Y_;
+    // For each user index, a list of item indices that the user has rated in the training set.
+    std::vector<std::vector<int>> user_items_;
+    // Precomputed implicit feedback vector per user: x_u = (1/sqrt(|N_u|)) * sum_{j in N_u} y_j.
+    // Flattened to size num_users * k, layout like P_. Only valid after build_user_items().
+    std::vector<double> user_x_;
+
     struct LogRow {
         int epoch = 0;
         double train_rmse = 0.0;

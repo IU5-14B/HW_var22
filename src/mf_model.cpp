@@ -4,6 +4,8 @@
 #include <cmath>
 #include <fstream>
 
+// -------------------- helpers --------------------
+
 void MFModel::build_mappings_from_train(const std::vector<Rating>& train) {
     u_id_to_idx_.clear();
     m_id_to_idx_.clear();
@@ -29,11 +31,17 @@ void MFModel::init_params() {
     P_.assign((size_t)U * (size_t)k, 0.0);
     Q_.assign((size_t)M * (size_t)k, 0.0);
 
+    // SVD++
+    Y_.assign((size_t)M * (size_t)k, 0.0);
+    user_x_.assign((size_t)U * (size_t)k, 0.0);
+    user_items_.assign((size_t)U, {});
+
     std::mt19937 rng(params_.seed);
     std::uniform_real_distribution<double> dist(-0.05, 0.05);
 
     for (auto& x : P_) x = dist(rng);
     for (auto& x : Q_) x = dist(rng);
+    for (auto& x : Y_) x = dist(rng);
 }
 
 double MFModel::dot_uv(int u_idx, int m_idx) const {
@@ -49,21 +57,35 @@ double MFModel::dot_uv(int u_idx, int m_idx) const {
 }
 
 double MFModel::predict_mapped(int u_idx, int m_idx) const {
-    return mu_ + bu_[u_idx] + bi_[m_idx] + dot_uv(u_idx, m_idx);
+    // SVD++: r_hat = mu + b_u + b_i + q_i^T (p_u + x_u)
+    const int k = params_.k;
+    const size_t u_off = (size_t)u_idx * (size_t)k;
+    const size_t m_off = (size_t)m_idx * (size_t)k;
+
+    double dot = 0.0;
+    for (int f = 0; f < k; ++f) {
+        dot += Q_[m_off + (size_t)f] * (P_[u_off + (size_t)f] + user_x_[u_off + (size_t)f]);
+    }
+    return mu_ + bu_[u_idx] + bi_[m_idx] + dot;
 }
 
 double MFModel::predict(int user_id, int movie_id) const {
     auto it_u = u_id_to_idx_.find(user_id);
     auto it_m = m_id_to_idx_.find(movie_id);
 
+    // Если и пользователь, и фильм известны — полноценный SVD++ прогноз
+    if (it_u != u_id_to_idx_.end() && it_m != m_id_to_idx_.end()) {
+        return predict_mapped(it_u->second, it_m->second);
+    }
+
+    // Иначе — базовый прогноз mu + доступные bias'ы
     double pred = mu_;
     if (it_u != u_id_to_idx_.end()) pred += bu_[it_u->second];
     if (it_m != m_id_to_idx_.end()) pred += bi_[it_m->second];
-    if (it_u != u_id_to_idx_.end() && it_m != m_id_to_idx_.end())
-        pred += dot_uv(it_u->second, it_m->second);
-
     return pred;
 }
+
+// -------------------- SGD (SVD++) --------------------
 
 void MFModel::sgd_one_epoch(const std::vector<Rating>& train,
                             std::vector<size_t>& order,
@@ -74,34 +96,77 @@ void MFModel::sgd_one_epoch(const std::vector<Rating>& train,
 
     std::shuffle(order.begin(), order.end(), rng);
 
-    for (size_t jj = 0; jj < order.size(); ++jj) {
-        const Rating& r = train[order[jj]];
+    // Временный буфер для старого q_i (нужно, чтобы обновлять y_j и x_u корректно)
+    std::vector<double> q_old((size_t)k);
+
+    for (size_t t = 0; t < order.size(); ++t) {
+        const Rating& r = train[order[t]];
 
         auto it_u = u_id_to_idx_.find(r.user_id);
         auto it_m = m_id_to_idx_.find(r.movie_id);
         if (it_u == u_id_to_idx_.end() || it_m == m_id_to_idx_.end()) continue;
 
         int u = it_u->second;
-        int m = it_m->second;
-
-        double pred = predict_mapped(u, m);
-        double err = (double)r.rating - pred;
-
-        bu_[u] += lr * (err - reg * bu_[u]);
-        bi_[m] += lr * (err - reg * bi_[m]);
+        int i = it_m->second;
 
         const size_t u_off = (size_t)u * (size_t)k;
-        const size_t m_off = (size_t)m * (size_t)k;
+        const size_t i_off = (size_t)i * (size_t)k;
 
+        // Сохраняем q_i до обновления
+        for (int f = 0; f < k; ++f) q_old[(size_t)f] = Q_[i_off + (size_t)f];
+
+        // Предсказание (SVD++)
+        double pred = mu_ + bu_[u] + bi_[i];
         for (int f = 0; f < k; ++f) {
-            double pu = P_[u_off + (size_t)f];
-            double qi = Q_[m_off + (size_t)f];
+            pred += q_old[(size_t)f] * (P_[u_off + (size_t)f] + user_x_[u_off + (size_t)f]);
+        }
 
-            P_[u_off + (size_t)f] = pu + lr * (err * qi - reg * pu);
-            Q_[m_off + (size_t)f] = qi + lr * (err * pu - reg * qi);
+        double err = (double)r.rating - pred;
+
+        // bias updates
+        bu_[u] += lr * (err - reg * bu_[u]);
+        bi_[i] += lr * (err - reg * bi_[i]);
+
+        // implicit normalization
+        const auto& Nu = user_items_[u];
+        const size_t n_u = Nu.size();
+        const double inv_sqrt = (n_u > 0) ? (1.0 / std::sqrt((double)n_u)) : 0.0;
+
+        // Update p_u and q_i
+        for (int f = 0; f < k; ++f) {
+            const double pu_old = P_[u_off + (size_t)f];
+            const double qi_old = q_old[(size_t)f];
+            const double xu_old = user_x_[u_off + (size_t)f];
+
+            // p_u
+            P_[u_off + (size_t)f] = pu_old + lr * (err * qi_old - reg * pu_old);
+
+            // q_i (важно: использует pu_old + x_u_old)
+            Q_[i_off + (size_t)f] = Q_[i_off + (size_t)f] + lr * (err * (pu_old + xu_old) - reg * Q_[i_off + (size_t)f]);
+        }
+
+        // Update y_j and cached x_u:
+        // y_j += lr*(err*q_i_old*inv_sqrt - reg*y_j)
+        // x_u += inv_sqrt * sum_j delta_y_j
+        if (n_u > 0 && inv_sqrt > 0.0) {
+            for (int j : Nu) {
+                const size_t j_off = (size_t)j * (size_t)k;
+                for (int f = 0; f < k; ++f) {
+                    double& yjf = Y_[j_off + (size_t)f];
+                    const double y_old = yjf;
+
+                    const double delta_y = lr * (err * q_old[(size_t)f] * inv_sqrt - reg * y_old);
+                    yjf = y_old + delta_y;
+
+                    // x_u is normalized sum of y_j, so add delta_y * inv_sqrt
+                    user_x_[u_off + (size_t)f] += delta_y * inv_sqrt;
+                }
+            }
         }
     }
 }
+
+// -------------------- RMSE / fit / logs --------------------
 
 long double MFModel::rmse_on_set_mapped_ld(const std::vector<Rating>& data,
                                           size_t& cold_u,
@@ -120,16 +185,18 @@ long double MFModel::rmse_on_set_mapped_ld(const std::vector<Rating>& data,
         if (cm) cold_m++;
 
         double pred = predict(r.user_id, r.movie_id);
-        long double err = (long double)r.rating - (long double)pred;
 
+        // clamp для явных рейтингов (1..5)
+        if (pred < 1.0) pred = 1.0;
+        else if (pred > 5.0) pred = 5.0;
+
+        long double err = (long double)r.rating - (long double)pred;
         se += err * err;
         n++;
     }
 
     if (n == 0) return 0.0L;
-    // чтобы не было ambiguous sqrt — считаем в long double и используем sqrtl
     return std::sqrt((long double)(se / (long double)n));
-
 }
 
 bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
@@ -139,6 +206,7 @@ bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
     log_.clear();
     if (train.empty()) return false;
 
+    // mu
     long double sum = 0.0L;
     for (const auto& r : train) sum += (long double)r.rating;
     mu_ = (double)(sum / (long double)train.size());
@@ -146,6 +214,32 @@ bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
     build_mappings_from_train(train);
     init_params();
 
+    // Build N(u) from TRAIN (не из val/test)
+    for (const auto& r : train) {
+        auto it_u = u_id_to_idx_.find(r.user_id);
+        auto it_m = m_id_to_idx_.find(r.movie_id);
+        if (it_u == u_id_to_idx_.end() || it_m == m_id_to_idx_.end()) continue;
+        user_items_[(size_t)it_u->second].push_back(it_m->second);
+    }
+
+    // Compute initial x_u = inv_sqrt(|N(u)|) * sum_{j in N(u)} y_j
+    const int k = params_.k;
+    std::fill(user_x_.begin(), user_x_.end(), 0.0);
+    for (size_t u = 0; u < user_items_.size(); ++u) {
+        const size_t n_u = user_items_[u].size();
+        if (n_u == 0) continue;
+        const double inv_sqrt = 1.0 / std::sqrt((double)n_u);
+
+        double* x_ptr = &user_x_[u * (size_t)k];
+        for (int j : user_items_[u]) {
+            const double* y_ptr = &Y_[(size_t)j * (size_t)k];
+            for (int f = 0; f < k; ++f) {
+                x_ptr[f] += y_ptr[f] * inv_sqrt;
+            }
+        }
+    }
+
+    // order
     std::vector<size_t> order(train.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
 
@@ -154,7 +248,8 @@ bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
     double best_val = 1e9;
     int no_improve = 0;
 
-    std::vector<double> best_bu, best_bi, best_P, best_Q;
+    // store best params (IMPORTANT: include Y_ and user_x_)
+    std::vector<double> best_bu, best_bi, best_P, best_Q, best_Y, best_X;
 
     for (int ep = 1; ep <= params_.epochs; ++ep) {
         auto t0 = std::chrono::steady_clock::now();
@@ -178,6 +273,8 @@ bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
             best_bi = bi_;
             best_P  = P_;
             best_Q  = Q_;
+            best_Y  = Y_;
+            best_X  = user_x_;
         } else {
             no_improve++;
             if (no_improve >= params_.patience) break;
@@ -189,6 +286,8 @@ bool MFModel::fit_with_early_stopping(const std::vector<Rating>& train,
         bi_ = std::move(best_bi);
         P_  = std::move(best_P);
         Q_  = std::move(best_Q);
+        Y_  = std::move(best_Y);
+        user_x_ = std::move(best_X);
     }
 
     return true;
