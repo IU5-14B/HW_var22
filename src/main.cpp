@@ -1,11 +1,13 @@
+#include <random>
+#include <algorithm>
+
 #include "data_loader.h"
 #include "metrics.h"
 #include "mf_model.h"
 
 #include <iostream>
 #include <filesystem>
-#include <random>
-#include <algorithm>
+
 
 static void train_test_split(const std::vector<Rating>& all,
                              std::vector<Rating>& train,
@@ -93,35 +95,39 @@ int main() {
                               mu, rmse_mu, rmse_user, cold_cases,
                               train.size(), test.size());
 
-    // === ШАГ 3: Матричная факторизация (SGD) ===
-    std::cout << "\n=== Шаг 3: Матричная факторизация (SGD) ===\n";
+    // === ШАГ 3: Матричная факторизация (SGD) + early stopping ===
+    std::cout << "\n=== Шаг 3: Матричная факторизация (SGD) + early stopping ===\n";
+
+    // делим train -> train2/val (например 90/10)
+    std::vector<Rating> train2, val;
+    train_test_split(train, train2, val, 0.10, 123); // 10% в val
 
     MFParams p;
     p.k = 50;
     p.epochs = 80;
     p.lr = 0.007;
-    p.reg = 0.07;
+    p.reg = 0.05;
     p.seed = 42;
+    p.patience = 5;
 
     std::cout << "Параметры: k=" << p.k
-              << ", epochs=" << p.epochs
-              << ", lr=" << p.lr
-              << ", reg=" << p.reg
-              << ", seed=" << p.seed << "\n";
+            << ", epochs=" << p.epochs
+            << ", lr=" << p.lr
+            << ", reg=" << p.reg
+            << ", seed=" << p.seed
+            << ", patience=" << p.patience << "\n";
+    std::cout << "Размер train2: " << train2.size() << ", val: " << val.size() << "\n";
 
     MFModel model;
-    if (!model.fit(train, p)) {
+    if (!model.fit_with_early_stopping(train2, val, p)) {
         std::cerr << "Ошибка: не удалось обучить MF-модель.\n";
         return 1;
     }
 
-    // Оценка на test + фиксация cold start
     auto eval = model.evaluate(test);
 
-    std::cout << "Mu (средний рейтинг по train): " << model.mu() << "\n";
-    std::cout << "Пользователей в train: " << model.num_users_train() << "\n";
-    std::cout << "Фильмов в train: " << model.num_movies_train() << "\n";
     std::cout << "RMSE на test (MF): " << eval.rmse << "\n";
+    std::cout << "RMSE на test (MF, нормализованный /5): " << (eval.rmse / 5.0) << "\n";
     std::cout << "Cold Start по пользователям (в test): " << eval.cold_user_cases << "\n";
     std::cout << "Cold Start по фильмам (в test): " << eval.cold_movie_cases << "\n";
 
@@ -130,7 +136,5 @@ int main() {
     } else {
         std::cout << "Лог обучения сохранён: results/mf_training_log.csv\n";
     }
-
-    std::cout << "\nГотово. Файлы результатов лежат в results/\n";
     return 0;
 }
