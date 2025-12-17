@@ -97,10 +97,10 @@ int main() {
     std::cout << "\n=== Шаг 3: Матричная факторизация (SGD) ===\n";
 
     MFParams p;
-    p.k = 80;
-    p.epochs = 60;
-    p.lr = 0.015;
-    p.reg = 0.02;
+    p.k = 50;
+    p.epochs = 80;
+    p.lr = 0.007;
+    p.reg = 0.07;
     p.seed = 42;
 
     std::cout << "Параметры: k=" << p.k
