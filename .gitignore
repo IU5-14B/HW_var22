@@ -1,14 +1,7 @@
-# build artifacts
 build/
 cmake-build-*/
-
-# datasets (не коммитим большие файлы)
 data/raw/
-
-# results (CSV и графики — локально)
 results/
-
-# editor / system
 .vscode/
 .idea/
 .DS_Store
